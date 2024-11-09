@@ -1,187 +1,230 @@
-import flwr as fl
-from typing import List, Tuple, Dict, Optional
-from flwr.common import Metrics, Parameters
+import socket
+import pickle
 import torch
 import torch.nn as nn
-import numpy as np
-from collections import OrderedDict
-from torch.utils.tensorboard import SummaryWriter
+from typing import Dict, List
+import threading
+from collections import defaultdict
+import matplotlib.pyplot as plt
 from datetime import datetime
-import logging
+import numpy as np
+from model import EmissionsModel
 import os
-import sys
+import matplotlib
+matplotlib.use('Agg')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+class FederatedServer:
+    def __init__(self, host='localhost', port=8080, num_clients=3):
+        self.host = host
+        self.port = port
+        self.input_dim = 2781  # Make sure this matches your model's input dimension
+        self.global_model = EmissionsModel(self.input_dim)
+        self.clients = {}  # Changed to dict to track clients by ID
+        self.current_round = 0
+        self.max_rounds = 10
+        self.num_clients = num_clients
+        self.received_updates = defaultdict(list)
+        self.lock = threading.Lock()
+        self.ready_to_start = threading.Event()
+        
+        # Metrics tracking
+        self.global_train_losses = []
+        self.global_val_losses = []
+        self.client_metrics = defaultdict(lambda: {'train_losses': [], 'val_losses': []})
 
-# Import the ImprovedCO2Model from client.py
-from updated_client import ImprovedCO2Model
-
-class ImprovedFedAvg(fl.server.strategy.FedAvg):
-    def __init__(
-        self,
-        *args,
-        min_available_clients: int = 3,
-        fraction_fit: float = 0.8,
-        fraction_evaluate: float = 0.5,
-        min_fit_clients: int = 3,
-        min_evaluate_clients: int = 2,
-        **kwargs,
-    ):
-        super().__init__(
-            *args,
-            min_available_clients=min_available_clients,
-            fraction_fit=fraction_fit,
-            fraction_evaluate=fraction_evaluate,
-            min_fit_clients=min_fit_clients,
-            min_evaluate_clients=min_evaluate_clients,
-            **kwargs,
-        )
-        
-        self.model = ImprovedCO2Model()
-        self.model.eval()
-        
-        # Initialize TensorBoard writer
-        self.writer = SummaryWriter(f"logs/server/{datetime.now().strftime('%Y%m%d-%H%M%S')}")
-        
-        # Track best model performance
-        self.best_accuracy = float('-inf')
-        self.best_parameters = None
-        
-    def initialize_parameters(self, client_manager=None) -> Parameters:
-        """Initialize model parameters."""
-        params = []
-        for param in self.model.parameters():
-            params.append(param.detach().cpu().numpy())
-        return fl.common.ndarrays_to_parameters(params)
+        # Ensure output directories exist
+        os.makedirs('GlobalGraph', exist_ok=True)
     
-    def aggregate_fit(
-        self,
-        server_round: int,
-        results: List[Tuple[Parameters, Dict]],
-        failures: List[BaseException],
-    ) -> Tuple[Optional[Parameters], Dict]:
-        """Aggregate model parameters and training metrics."""
-        if not results:
-            return None, {}
+    def aggregate_models(self, updates: List[Dict], client_weights: Dict[int, float]) -> None:
+        """Aggregate model updates using weighted FedAvg with type checking"""
+        averaged_dict = {}
+        total_weight = sum(client_weights.values())
         
-        # Extract parameters and metrics from results
-        parameters_list = [parameters for parameters, _ in results]
-        metrics_list = [metrics for _, metrics in results]
+        # Initialize averaged_dict with zeros of the correct type
+        for key, param in self.global_model.state_dict().items():
+            averaged_dict[key] = torch.zeros_like(param, dtype=param.dtype)
         
-        # Aggregate parameters (weighted by number of examples)
-        weights = [metrics["num_examples"] for _, metrics in results]
-        total_examples = sum(weights)
-        weighted_metrics = {
-            "loss": np.average(
-                [metrics["loss"] for metrics in metrics_list],
-                weights=weights
-            ),
-            "rmse": np.average(
-                [metrics["rmse"] for metrics in metrics_list],
-                weights=weights
-            ),
-            "mae": np.average(
-                [metrics["mae"] for metrics in metrics_list],
-                weights=weights
-            )
-        }
+        # Weighted sum of parameters
+        for update, client_id in zip(updates, client_weights.keys()):
+            weight = client_weights[client_id] / total_weight
+            for key in averaged_dict.keys():
+                # Ensure correct dtype for multiplication
+                weight_tensor = torch.tensor(weight, dtype=update[key].dtype)
+                averaged_dict[key] += weight_tensor * update[key]
         
-        # Log metrics to TensorBoard
-        self.writer.add_scalar('Train/Loss', weighted_metrics["loss"], server_round)
-        self.writer.add_scalar('Train/RMSE', weighted_metrics["rmse"], server_round)
-        self.writer.add_scalar('Train/MAE', weighted_metrics["mae"], server_round)
-        
-        # Aggregate parameters
-        aggregated_parameters = super().aggregate_fit(server_round, results, failures)[0]
-        
-        return aggregated_parameters, weighted_metrics
+        self.global_model.load_state_dict(averaged_dict)
     
-    def aggregate_evaluate(
-        self,
-        server_round: int,
-        results: List[Tuple[Parameters, Dict]],
-        failures: List[BaseException],
-    ) -> Tuple[Optional[float], Dict]:
-        """Aggregate evaluation metrics."""
-        if not results:
-            return None, {}
+    def plot_global_metrics(self):
+        """Plot global training and validation metrics"""
+        plt.figure(figsize=(12, 6))
         
-        # Extract metrics
-        metrics_list = [metrics for _, metrics in results]
+        # Plot global losses
+        plt.subplot(1, 2, 1)
+        plt.plot(self.global_train_losses, label='Global Training Loss', marker='o')
+        plt.plot(self.global_val_losses, label='Global Validation Loss', marker='s')
+        plt.xlabel('Round')
+        plt.ylabel('Loss')
+        plt.title('Global Model Learning Curves')
+        plt.legend()
+        plt.grid(True)
         
-        # Calculate weighted averages
-        weights = [metrics["num_examples"] for _, metrics in results]
-        weighted_metrics = {
-            "loss": np.average(
-                [metrics["loss"] for metrics in metrics_list],
-                weights=weights
-            ),
-            "rmse": np.average(
-                [metrics["rmse"] for metrics in metrics_list],
-                weights=weights
-            ),
-            "mae": np.average(
-                [metrics["mae"] for metrics in metrics_list],
-                weights=weights
-            )
-        }
+        # Plot client performances
+        plt.subplot(1, 2, 2)
+        for client_id, metrics in self.client_metrics.items():
+            plt.plot(metrics['val_losses'], 
+                    label=f'Client {client_id}', 
+                    marker='o',
+                    linestyle='--')
+        plt.xlabel('Round')
+        plt.ylabel('Validation Loss')
+        plt.title('Client-wise Performance')
+        plt.legend()
+        plt.grid(True)
         
-        # Log evaluation metrics to TensorBoard
-        self.writer.add_scalar('Eval/Loss', weighted_metrics["loss"], server_round)
-        self.writer.add_scalar('Eval/RMSE', weighted_metrics["rmse"], server_round)
-        self.writer.add_scalar('Eval/MAE', weighted_metrics["mae"], server_round)
+        plt.tight_layout()
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        plt.savefig(f'GlobalGraph/global_metrics_{timestamp}.png')
+        plt.close()
+    
+    def track_metrics(self, client_id: int, train_loss: float, val_loss: float) -> None:
+        """Track metrics for each client and global model"""
+        self.client_metrics[client_id]['train_losses'].append(train_loss)
+        self.client_metrics[client_id]['val_losses'].append(val_loss)
         
-        # Update best model if current model performs better
-        if weighted_metrics["rmse"] < self.best_accuracy:
-            self.best_accuracy = weighted_metrics["rmse"]
-            # Get parameters from the first result (they should all be the same)
-            self.best_parameters = results[0][0]
+        # Calculate and store global averages
+        avg_train_loss = np.mean([metrics['train_losses'][-1] 
+                                for metrics in self.client_metrics.values()])
+        avg_val_loss = np.mean([metrics['val_losses'][-1] 
+                              for metrics in self.client_metrics.values()])
+        
+        self.global_train_losses.append(avg_train_loss)
+        self.global_val_losses.append(avg_val_loss)
+        
+        print(f"\nGlobal Metrics for Round {self.current_round + 1}:")
+        print(f"Average Training Loss: {avg_train_loss:.6f}")
+        print(f"Average Validation Loss: {avg_val_loss:.6f}")
+    
+    def handle_client(self, client_socket, address):
+        """Handle individual client connections"""
+        with self.lock:
+            client_id = len(self.clients)
+            self.clients[client_id] = client_socket
+            print(f"New connection from {address} (Client {client_id})")
+
+            if len(self.clients) == self.num_clients:
+                print("All clients connected. Starting training...")
+                self.ready_to_start.set()
+
+        self.ready_to_start.wait()
+        
+        try:
+            while self.current_round < self.max_rounds:
+                # Send current model to client
+                client_socket.send(pickle.dumps(self.global_model.state_dict()))
+                
+                # Receive client update
+                data = self.receive_data(client_socket)
+                if not data:
+                    print(f"Client {client_id} disconnected")
+                    break
+
+                model_state = data['model_state']
+                metrics = data['metrics']
+                train_loss = metrics['train_loss']
+                val_loss = metrics['val_loss']
+                
+                with self.lock:
+                    self.track_metrics(client_id, train_loss, val_loss)
+                    self.received_updates[self.current_round].append((model_state, client_id))
+                    
+                    if len(self.received_updates[self.current_round]) == len(self.clients):
+                        print(f"\nRound {self.current_round + 1} complete")
+                        updates, client_ids = zip(*self.received_updates[self.current_round])
+                        client_weights = {cid: 1.0 for cid in client_ids}
+                        
+                        self.aggregate_models(updates, client_weights)
+                        self.plot_global_metrics()  # Plot after each round
+                        
+                        self.current_round += 1
+                        self.received_updates[self.current_round] = []
+        
+        except Exception as e:
+            print(f"Error handling client {address}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            with self.lock:
+                if client_id in self.clients:
+                    del self.clients[client_id]
+            client_socket.close()
+
+    def receive_data(self, client_socket):
+        """Receive data from client with proper buffering"""
+        data = b""
+        while True:
+            try:
+                packet = client_socket.recv(4096)
+                if not packet:
+                    return None
+                data += packet
+                if len(packet) < 4096:
+                    break
+            except socket.error as e:
+                print(f"Socket error while receiving data: {e}")
+                return None
+
+        try:
+            return pickle.loads(data)
+        except Exception as e:
+            print(f"Error unpickling data: {e}")
+            return None
+
+    def start(self):
+        """Start the federated learning server"""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        try:
+            server_socket.bind((self.host, self.port))
+            server_socket.listen(self.num_clients)
             
-            # Save best model parameters
-            torch.save(
-                self.model.state_dict(),
-                f"models/best_model_round_{server_round}.pth"
-            )
-        
-        return weighted_metrics["loss"], weighted_metrics
-
-def main():
-    try:
-        # Create necessary directories
-        os.makedirs("models", exist_ok=True)
-        os.makedirs("logs/server", exist_ok=True)
-        
-        logger.info("Starting Federated Learning server...")
-        
-        # Define strategy with proper logging
-        logger.info("Initializing strategy...")
-        strategy = ImprovedFedAvg(
-            min_available_clients=1,  # Reduced for testing
-            min_fit_clients=1,
-            min_evaluate_clients=1,
-            fraction_fit=0.8,
-            fraction_evaluate=0.5,
-        )
-        
-        # Configure server
-        logger.info("Configuring server...")
-        config = fl.server.ServerConfig(num_rounds=50)
-        
-        # Start server with proper error handling
-        logger.info("Starting server on [::]:8081")
-        fl.server.start_server(
-            server_address="[::]:8081",  # Using IPv6 notation
-            strategy=strategy,
-            config=config,
-        )
-        
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        sys.exit(1)
+            print(f"Server listening on {self.host}:{self.port}")
+            print(f"Waiting for {self.num_clients} clients to connect...")
+            
+            while True:
+                try:
+                    client_socket, address = server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                    if self.current_round >= self.max_rounds:
+                        print("Maximum rounds reached. Stopping server...")
+                        break
+                        
+                except socket.error as e:
+                    print(f"Socket error while accepting connection: {e}")
+                    continue
+                except Exception as e:
+                    print(f"Unexpected error while accepting connection: {e}")
+                    continue
+            
+            # Plot final metrics
+            if self.global_train_losses:
+                self.plot_global_metrics()
+                print("\nFinal Global Metrics:")
+                print(f"Average Training Loss: {self.global_train_losses[-1]:.6f}")
+                print(f"Average Validation Loss: {self.global_val_losses[-1]:.6f}")
+            
+        except KeyboardInterrupt:
+            print("\nServer shutting down...")
+        finally:
+            server_socket.close()
+            print("Server stopped.")
 
 if __name__ == "__main__":
-    main()
+    server = FederatedServer(num_clients=3)
+    server.start()

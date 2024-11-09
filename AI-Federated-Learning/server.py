@@ -113,7 +113,7 @@ class CustomFedAvg(fl.server.strategy.FedAvg):
 
 def main():
     # Server configuration
-    server_config = fl.server.ServerConfig(num_rounds=3)
+    server_config = fl.server.ServerConfig(num_rounds=10)
     
     # Initialize strategy with proper configuration
     strategy = CustomFedAvg(

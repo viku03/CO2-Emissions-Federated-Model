@@ -58,7 +58,7 @@ class EmissionClient(fl.client.NumPyClient):
         self.model = model
         self.train_loader = train_loader
         self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.00001, weight_decay=1e-9)
         self.device = torch.device("mps")
         
     def get_parameters(self, config):
@@ -86,7 +86,7 @@ class EmissionClient(fl.client.NumPyClient):
         total_loss = 0
         
         print("\nStarting training round...")
-        for epoch in range(3):
+        for epoch in range(5):
             epoch_loss = 0
             for batch_idx, (X_batch, y_batch) in enumerate(self.train_loader):
                 X_batch = X_batch.to(self.device)
@@ -102,14 +102,14 @@ class EmissionClient(fl.client.NumPyClient):
                 epoch_loss += loss.item()
                 
                 if batch_idx % 10 == 0:
-                    print(f"Epoch {epoch+1}/3, Batch {batch_idx}/{len(self.train_loader)}, "
+                    print(f"Epoch {epoch+1}/5, Batch {batch_idx}/{len(self.train_loader)}, "
                           f"Loss: {loss.item():.4f}")
             
             avg_epoch_loss = epoch_loss / len(self.train_loader)
             print(f"Epoch {epoch+1} completed - Avg Loss: {avg_epoch_loss:.4f}")
             total_loss += avg_epoch_loss
             
-        return self.get_parameters({}), len(self.train_loader.dataset), {"loss": total_loss / 3}
+        return self.get_parameters({}), len(self.train_loader.dataset), {"loss": total_loss / 5}
     
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -134,7 +134,7 @@ class EmissionClient(fl.client.NumPyClient):
 
 def main():
     # Load and preprocess data
-    data = pd.read_csv("Dataset/flight.csv")
+    data = pd.read_csv("Dataset/2023.csv")
     
     features = ['LATITUDE', 'LONGITUDE', 'GHG QUANTITY (METRIC TONS CO2e)']
     data_clean = data[features].copy()
