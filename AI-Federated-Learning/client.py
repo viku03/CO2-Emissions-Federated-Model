@@ -1,172 +1,128 @@
-import flwr as fl
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
-import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+import flwr as fl
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
-from collections import OrderedDict
 
-class CO2Model(nn.Module):
-    def __init__(self):
-        super(CO2Model, self).__init__()
-        self.input_size = 2
-        self.hidden1_size = 128
-        self.hidden2_size = 64
-        self.hidden3_size = 32
-        self.output_size = 1
-
-        # Layer definitions
-        self.fc1 = nn.Linear(self.input_size, self.hidden1_size)
-        self.fc2 = nn.Linear(self.hidden1_size, self.hidden2_size)
-        self.fc3 = nn.Linear(self.hidden2_size, self.hidden3_size)
-        self.fc4 = nn.Linear(self.hidden3_size, self.output_size)
-        
-        # Batch normalization layers with track_running_stats=False
-        self.batch_norm1 = nn.BatchNorm1d(self.hidden1_size, track_running_stats=False)
-        self.batch_norm2 = nn.BatchNorm1d(self.hidden2_size, track_running_stats=False)
-        self.batch_norm3 = nn.BatchNorm1d(self.hidden3_size, track_running_stats=False)
-        
+# Define the neural network model
+class EmissionsModel(nn.Module):
+    def __init__(self, input_dim):
+        super(EmissionsModel, self).__init__()
+        self.layer1 = nn.Linear(input_dim, 128)
+        self.layer2 = nn.Linear(128, 64)
+        self.layer3 = nn.Linear(64, 32)
+        self.layer4 = nn.Linear(32, 1)
+        self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.2)
-        
+        self.batch_norm1 = nn.BatchNorm1d(128, momentum=0.1)
+        self.batch_norm2 = nn.BatchNorm1d(64, momentum=0.1)
+        self.batch_norm3 = nn.BatchNorm1d(32, momentum=0.1)
+
     def forward(self, x):
-        x = self.fc1(x)
-        if x.size(0) > 1:  # Only apply batch norm if batch size > 1
-            x = self.batch_norm1(x)
-        x = torch.relu(x)
+        x = self.relu(self.batch_norm1(self.layer1(x)))
         x = self.dropout(x)
-        
-        x = self.fc2(x)
-        if x.size(0) > 1:
-            x = self.batch_norm2(x)
-        x = torch.relu(x)
+        x = self.relu(self.batch_norm2(self.layer2(x)))
         x = self.dropout(x)
-        
-        x = self.fc3(x)
-        if x.size(0) > 1:
-            x = self.batch_norm3(x)
-        x = torch.relu(x)
-        x = self.dropout(x)
-        
-        x = self.fc4(x)
+        x = self.relu(self.batch_norm3(self.layer3(x)))
+        x = self.layer4(x)
         return x
 
-class EmissionClient(fl.client.NumPyClient):
-    def __init__(self, model, train_loader):
+# Load and preprocess data
+def load_data(year):
+    # Load the CSV file for the specified year
+    data = pd.read_csv(f"Dataset/{year}.csv")
+
+    # Select features and target
+    features = data[["LATITUDE", "LONGITUDE"]]
+    target = data["GHG QUANTITY (METRIC TONS CO2e)"]
+
+    # Scale features
+    scaler = StandardScaler()
+    features = scaler.fit_transform(features)
+
+    # Split the data into train and test sets
+    train_features, test_features, train_target, test_target = train_test_split(
+        features, target, test_size=0.2, random_state=42
+    )
+
+    # Convert to PyTorch tensors
+    train_features = torch.tensor(train_features, dtype=torch.float32)
+    train_target = torch.tensor(train_target.values, dtype=torch.float32).view(-1, 1)
+    test_features = torch.tensor(test_features, dtype=torch.float32)
+    test_target = torch.tensor(test_target.values, dtype=torch.float32).view(-1, 1)
+
+    # Create DataLoader instances
+    train_loader = DataLoader(TensorDataset(train_features, train_target), batch_size=32, shuffle=True)
+    test_loader = DataLoader(TensorDataset(test_features, test_target), batch_size=32, shuffle=False)
+
+    return train_loader, test_loader
+
+# Define Flower client
+class CO2EmissionsClient(fl.client.NumPyClient):
+    def __init__(self, model, train_loader, test_loader, device):
         self.model = model
         self.train_loader = train_loader
-        self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.00001, weight_decay=1e-9)
-        self.device = torch.device("mps")
-        
-    def get_parameters(self, config):
-        """Get parameters that should be serialized."""
-        return [param.cpu().detach().numpy() for name, param in self.model.named_parameters()
-                if 'running' not in name]  # Exclude running stats
-    
+        self.test_loader = test_loader
+        self.device = device
+        self.model.to(self.device)
+
+    def get_parameters(self):
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+
     def set_parameters(self, parameters):
-        """Set model parameters from a list of NumPy ndarrays."""
-        params_dict = zip([name for name, _ in self.model.named_parameters() 
-                         if 'running' not in name], parameters)
-        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-        
-        # Update only trainable parameters
-        current_state = self.model.state_dict()
-        for key in current_state:
-            if key in state_dict:
-                current_state[key] = state_dict[key]
-        
-        self.model.load_state_dict(current_state, strict=False)
-    
+        params_dict = zip(self.model.state_dict().keys(), parameters)
+        state_dict = {k: torch.tensor(v) for k, v in params_dict}
+        self.model.load_state_dict(state_dict, strict=True)
+
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         self.model.train()
-        total_loss = 0
-        
-        print("\nStarting training round...")
-        for epoch in range(5):
-            epoch_loss = 0
-            for batch_idx, (X_batch, y_batch) in enumerate(self.train_loader):
-                X_batch = X_batch.to(self.device)
-                y_batch = y_batch.to(self.device)
-                
-                self.optimizer.zero_grad()
-                predictions = self.model(X_batch)
-                loss = self.criterion(predictions, y_batch)
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+
+        for epoch in range(1):  # Adjust number of epochs as needed
+            for features, target in self.train_loader:
+                features, target = features.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                outputs = self.model(features)
+                loss = criterion(outputs, target)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                
-                if batch_idx % 10 == 0:
-                    print(f"Epoch {epoch+1}/5, Batch {batch_idx}/{len(self.train_loader)}, "
-                          f"Loss: {loss.item():.4f}")
-            
-            avg_epoch_loss = epoch_loss / len(self.train_loader)
-            print(f"Epoch {epoch+1} completed - Avg Loss: {avg_epoch_loss:.4f}")
-            total_loss += avg_epoch_loss
-            
-        return self.get_parameters({}), len(self.train_loader.dataset), {"loss": total_loss / 5}
-    
+                optimizer.step()
+
+        return self.get_parameters(), len(self.train_loader.dataset), {}
+
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
-        
+        criterion = nn.MSELoss()
+        loss = 0
         with torch.no_grad():
-            X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(self.device)
-            y_test_tensor = torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1).to(self.device)
-            
-            predictions = self.model(X_test_tensor)
-            loss = self.criterion(predictions, y_test_tensor)
-            
-            y_mean = y_test_tensor.mean()
-            total_sum_squares = ((y_test_tensor - y_mean) ** 2).sum()
-            residual_sum_squares = ((y_test_tensor - predictions) ** 2).sum()
-            r2 = 1 - (residual_sum_squares / total_sum_squares)
-            
-        return float(loss.cpu().numpy()), len(y_test), {
-            "loss": float(loss.cpu().numpy()),
-            "r2": float(r2.cpu().numpy())
-        }
+            for features, target in self.test_loader:
+                features, target = features.to(self.device), target.to(self.device)
+                outputs = self.model(features)
+                loss += criterion(outputs, target).item()
+
+        loss /= len(self.test_loader)
+        return float(loss), len(self.test_loader.dataset), {}
 
 def main():
-    # Load and preprocess data
-    data = pd.read_csv("Dataset/2023.csv")
+    # Device configuration
+    device = torch.device("mps" if torch.cuda.is_available() else "cpu")
+
+    # Load data
+    train_loader, test_loader = load_data(2023)
+
+    # Initialize the model
+    model = EmissionsModel(input_dim=2)  # LATITUDE and LONGITUDE
+
+    # Create and start Flower client
+    client = CO2EmissionsClient(model, train_loader, test_loader, device)
     
-    features = ['LATITUDE', 'LONGITUDE', 'GHG QUANTITY (METRIC TONS CO2e)']
-    data_clean = data[features].copy()
-    data_clean = data_clean.dropna()
-    
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(data_clean)
-    data_scaled = pd.DataFrame(scaled_features, columns=data_clean.columns)
-    
-    X = data_scaled[['LATITUDE', 'LONGITUDE']].values
-    y = data_scaled['GHG QUANTITY (METRIC TONS CO2e)'].values
-    
-    global X_test, y_test
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    train_dataset = TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32),
-        torch.tensor(y_train, dtype=torch.float32).reshape(-1, 1)
-    )
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    
-    device = torch.device("mps")
-    print(f"Using device: {device}")
-    
-    model = CO2Model()
-    model = model.to(device)
-    client = EmissionClient(model, train_loader)
-    
-    fl.client.start_client(
-        server_address="0.0.0.0:8081",
-        client=client
-    )
+    # Using the new `start_client()` method (as the previous `start_numpy_client()` is deprecated)
+    fl.client.start_client(server_address="127.0.0.1:8080", client=client)
 
 if __name__ == "__main__":
     main()

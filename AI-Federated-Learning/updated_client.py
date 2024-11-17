@@ -1,3 +1,4 @@
+# client.py
 import socket
 import pickle
 import numpy as np
@@ -10,8 +11,9 @@ import matplotlib.pyplot as plt
 from typing import Tuple, Dict
 import seaborn as sns
 from datetime import datetime
+import time
 
-from model import EmissionsModel
+from updated_model import EmissionsModel
 
 class EmissionsDataset(Dataset):
     def __init__(self, features, targets):
@@ -99,7 +101,12 @@ class FederatedClient:
         self.input_dim = sample_features.shape[1]
         
         # Initialize model and tracking
-        self.model = EmissionsModel(self.input_dim)
+        self.model = EmissionsModel(
+        input_dim=self.input_dim,
+        hidden_dims=[256, 128, 64],  # Optional: customize architecture
+        dropout_rate=0.3,            # Optional: adjust dropout
+        batch_norm_momentum=0.1      # Optional: adjust batch norm momentum
+        )
         self.tracker = TrainingTracker()
     
     def receive_data(self, client_socket):
@@ -211,8 +218,16 @@ class FederatedClient:
         return total_loss / len(val_loader), predictions, actuals
     
 
-    def train_local_model(self, epochs=50, batch_size=32, learning_rate=0.001):
-        """Train the model with early stopping and validation"""
+    def train_local_model(self, epochs=50, batch_size=32, learning_rate=0.001, max_time=300):
+        """Train the model with early stopping, validation, and time limit"""
+
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            print("Using MPS device")
+
+        else:
+            device = torch.device("cpu")
+            print("Using CPU device")
         features, targets = self.preprocess_data(training=True)
         train_loader, val_loader = self.create_data_loaders(features, targets, batch_size)
         
@@ -224,11 +239,23 @@ class FederatedClient:
         best_val_loss = float('inf')
         best_train_loss = None
         
+        start_time = time.time()
+        
         for epoch in range(epochs):
+            # Check time limit
+            if time.time() - start_time > max_time:
+                print(f"Training stopped due to time limit ({max_time}s)")
+                break
+                
             self.model.train()
             total_train_loss = 0
+            batch_count = 0
             
             for batch_features, batch_targets in train_loader:
+                # Print progress every 10 batches
+                if batch_count % 10 == 0:
+                    print(f"Epoch {epoch + 1}, Batch {batch_count}/{len(train_loader)}")
+                
                 optimizer.zero_grad()
                 outputs = self.model(batch_features)
                 loss = criterion(outputs, batch_targets)
@@ -239,6 +266,7 @@ class FederatedClient:
                 
                 optimizer.step()
                 total_train_loss += loss.item()
+                batch_count += 1
             
             # Calculate average training loss
             avg_train_loss = total_train_loss / len(train_loader)
@@ -252,20 +280,26 @@ class FederatedClient:
             # Update tracker
             self.tracker.update(avg_train_loss, avg_val_loss, predictions, actuals)
             
-            print(f"Epoch {epoch + 1}")
+            elapsed = time.time() - start_time
+            print(f"Epoch {epoch + 1} ({elapsed:.1f}s)")
             print(f"Training Loss: {avg_train_loss:.6f}")
             print(f"Validation Loss: {avg_val_loss:.6f}")
+            print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
             
             # Save best model
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 best_train_loss = avg_train_loss
+                torch.save(self.model.state_dict(), 'best_model.pth')
             
             # Early stopping check
             early_stopping(avg_val_loss)
             if early_stopping.early_stop:
                 print("Early stopping triggered")
                 break
+        
+        # Load best model before returning
+        self.model.load_state_dict(torch.load('best_model.pth'))
         
         # Plot training results
         self.tracker.plot_losses()
